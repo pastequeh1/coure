@@ -1,0 +1,515 @@
+// ========== DÉFINITION DES PINS ==========
+// LED Véhicule
+const int LED_VERT_VEHICULE = 12;
+const int LED_ORANGE_VEHICULE = 11;
+const int LED_ROUGE_VEHICULE = 10;
+
+// LED Piéton
+const int LED_VERT_PIETON = 9;
+const int LED_ROUGE_PIETON = 8;
+
+// Boutons
+const int BTN_PRIORITAIRE = 4;
+const int BTN_PIETON = 3;
+const int BTN_DEFAILLANT = 2;
+
+// ========== DÉFINITION DES ÉTATS ==========
+enum Etat {
+  VERT_NORMAL,      // Feu vert en fonctionnement normal
+  ORANGE_NORMAL,    // Feu orange en fonctionnement normal
+  ROUGE_NORMAL,     // Feu rouge en fonctionnement normal
+  PIETON_ORANGE,    // Passage piéton demandé, phase orange
+  PIETON_ROUGE,     // Passage piéton demandé, phase rouge
+  PIETON_PASSAGE,   // Le piéton traverse (feu piéton vert)
+  PIETON_SECURITE,  // Attente de sécurité après passage piéton
+  PRIORITAIRE,      // Mode véhicule de secours actif
+  PRIO_SECURITE,    // Attente de sécurité après mode prioritaire
+  PRIO_ORANGE,      // Phase orange après mode prioritaire
+  PRIO_ROUGE,       // Phase rouge après mode prioritaire
+  DEFAILLANT        // Mode maintenance (orange clignotant)
+};
+
+// ========== VARIABLES GLOBALES ==========
+Etat etatActuel = VERT_NORMAL;
+unsigned long tempsDebut = 0;
+unsigned long tempsClignotement = 0;
+bool etatClignotement = false;
+bool demandePieton = false;
+bool modeDefaillantActif = false;
+bool modePrioritaireActif = false;  // Nouvelle variable pour tracker l'état du mode prio
+bool modeTestActif = false;  // Mode test pour photos
+
+// Durées en millisecondes
+const unsigned long DUREE_VERT = 5000;       // 5 secondes
+const unsigned long DUREE_ORANGE = 3000;     // 3 secondes
+const unsigned long DUREE_ROUGE = 5000;      // 5 secondes
+const unsigned long DUREE_SECURITE_PIETON = 2000;  // 2 secondes
+const unsigned long DUREE_SECURITE_PRIO = 3000;    // 3 secondes
+const unsigned long DUREE_CLIGNOTEMENT = 500;      // 0,5 seconde
+
+// Anti-rebond
+unsigned long dernierAppuiPieton = 0;
+unsigned long dernierAppuiPrio = 0;
+unsigned long dernierAppuiDefaillant = 0;
+const unsigned long DELAI_ANTIREBOND = 50;
+
+bool dernierEtatBtnDefaillant = LOW;
+bool dernierEtatBtnPrio = LOW;  // Nouvelle variable pour détecter les fronts
+
+// ========== SETUP ==========
+void setup() {
+  // Initialisation de la communication série
+  Serial.begin(9600);
+  Serial.println(F("================================="));
+  Serial.println(F("FEU TRICOLORE INTELLIGENT"));
+  Serial.println(F("Light It Right - Version 1.1"));
+  Serial.println(F("================================="));
+  Serial.println();
+  
+  // Configuration des LED en sortie
+  pinMode(LED_VERT_VEHICULE, OUTPUT);
+  pinMode(LED_ORANGE_VEHICULE, OUTPUT);
+  pinMode(LED_ROUGE_VEHICULE, OUTPUT);
+  pinMode(LED_VERT_PIETON, OUTPUT);
+  pinMode(LED_ROUGE_PIETON, OUTPUT);
+  
+  // Configuration des boutons en entrée
+  pinMode(BTN_PRIORITAIRE, INPUT);
+  pinMode(BTN_PIETON, INPUT);
+  pinMode(BTN_DEFAILLANT, INPUT);
+  
+  // Initialisation: tout éteint sauf rouge piéton
+  eteindreToutesLED();
+  digitalWrite(LED_ROUGE_PIETON, HIGH);
+  digitalWrite(LED_VERT_VEHICULE, HIGH);
+  
+  tempsDebut = millis();
+  
+  Serial.println(F("Systeme initialise"));
+  Serial.println(F("Etat initial : VERT_NORMAL"));
+  Serial.println();
+  Serial.println(F("=== MODE TEST DISPONIBLE ==="));
+  Serial.println(F("Commandes serie:"));
+  Serial.println(F("  V = Vert | O = Orange | R = Rouge"));
+  Serial.println(F("  P = Pieton traverse | D = Defaillant"));
+  Serial.println(F("  N = Mode Normal | T = Test ON/OFF"));
+  Serial.println(F("============================"));
+  Serial.println();
+}
+
+// ========== BOUCLE PRINCIPALE ==========
+void loop() {
+  unsigned long tempsActuel = millis();
+  
+  // Gestion des commandes série pour mode test
+  gererCommandesSerie();
+  
+  // Si en mode test, on n'exécute pas la logique normale
+  if (modeTestActif) {
+    return;
+  }
+  
+  // Gestion du bouton défaillant (priorité absolue)
+  gererBoutonDefaillant(tempsActuel);
+  
+  // Si en mode défaillant, on ne fait que gérer le clignotement
+  if (modeDefaillantActif) {
+    gererModeDefaillant(tempsActuel);
+    return;
+  }
+  
+  // Gestion du bouton prioritaire avec détection de front (toggle on/off)
+  gererBoutonPrioritaire(tempsActuel);
+  
+  // Gestion du bouton piéton (seulement en mode VERT_NORMAL)
+  if (digitalRead(BTN_PIETON) == HIGH && 
+      tempsActuel - dernierAppuiPieton > DELAI_ANTIREBOND &&
+      etatActuel == VERT_NORMAL && !demandePieton) {
+    Serial.println(F(">>> BTN PIETON <<<"));
+    demandePieton = true;
+    dernierAppuiPieton = tempsActuel;
+  }
+  
+  // Affichage si bouton piéton appuyé en dehors du vert
+  if (digitalRead(BTN_PIETON) == HIGH && 
+      tempsActuel - dernierAppuiPieton > DELAI_ANTIREBOND &&
+      etatActuel != VERT_NORMAL) {
+    Serial.println(F(">>> BTN PIETON (IGNORE) <<<"));
+    dernierAppuiPieton = tempsActuel;
+  }
+  
+  // Machine à états
+  switch (etatActuel) {
+    
+    case VERT_NORMAL:
+      afficherEtat("VERT_NORMAL", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, HIGH);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, LOW);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      // Si demande piéton, passer immédiatement à orange
+      if (demandePieton) {
+        Serial.println(F("---> PIETON_ORANGE"));
+        etatActuel = PIETON_ORANGE;
+        tempsDebut = tempsActuel;
+        demandePieton = false;
+      }
+      // Sinon, attendre la fin du temps vert
+      else if (tempsActuel - tempsDebut >= DUREE_VERT) {
+        Serial.println(F("---> ORANGE_NORMAL"));
+        etatActuel = ORANGE_NORMAL;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case ORANGE_NORMAL:
+      afficherEtat("ORANGE_NORMAL", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, HIGH);
+      digitalWrite(LED_ROUGE_VEHICULE, LOW);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      if (tempsActuel - tempsDebut >= DUREE_ORANGE) {
+        Serial.println(F("---> ROUGE_NORMAL"));
+        etatActuel = ROUGE_NORMAL;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case ROUGE_NORMAL:
+      afficherEtat("ROUGE_NORMAL", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, HIGH);
+      digitalWrite(LED_VERT_PIETON, HIGH); // Piéton peut traverser
+      digitalWrite(LED_ROUGE_PIETON, LOW);
+      
+      if (tempsActuel - tempsDebut >= DUREE_ROUGE) {
+        Serial.println(F("---> VERT_NORMAL"));
+        Serial.println(F("===== CYCLE ====="));
+        etatActuel = VERT_NORMAL;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case PIETON_ORANGE:
+      afficherEtat("PIETON_ORANGE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, HIGH);
+      digitalWrite(LED_ROUGE_VEHICULE, LOW);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      if (tempsActuel - tempsDebut >= DUREE_ORANGE) {
+        Serial.println(F("---> PIETON_ROUGE"));
+        etatActuel = PIETON_ROUGE;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case PIETON_ROUGE:
+      afficherEtat("PIETON_ROUGE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, HIGH);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      // Courte transition avant le passage
+      if (tempsActuel - tempsDebut >= 500) {
+        Serial.println(F("---> PIETON_PASSAGE"));
+        etatActuel = PIETON_PASSAGE;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case PIETON_PASSAGE:
+      afficherEtat("PIETON_PASSAGE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, HIGH);
+      digitalWrite(LED_VERT_PIETON, HIGH); // Piéton traverse
+      digitalWrite(LED_ROUGE_PIETON, LOW);
+      
+      if (tempsActuel - tempsDebut >= DUREE_ROUGE) {
+        Serial.println(F("---> SECURITE"));
+        etatActuel = PIETON_SECURITE;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case PIETON_SECURITE:
+      afficherEtat("PIETON_SECURITE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, HIGH);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      if (tempsActuel - tempsDebut >= DUREE_SECURITE_PIETON) {
+        Serial.println(F("---> VERT_NORMAL"));
+        etatActuel = VERT_NORMAL;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case PRIORITAIRE:
+      afficherEtat("PRIORITAIRE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, HIGH);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, LOW);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      // Le mode reste actif jusqu'au prochain clic
+      break;
+      
+    case PRIO_SECURITE:
+      afficherEtat("PRIO_SECURITE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, HIGH);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, LOW);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      if (tempsActuel - tempsDebut >= DUREE_SECURITE_PRIO) {
+        Serial.println(F("---> PRIO_ORANGE"));
+        etatActuel = PRIO_ORANGE;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case PRIO_ORANGE:
+      afficherEtat("PRIO_ORANGE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, HIGH);
+      digitalWrite(LED_ROUGE_VEHICULE, LOW);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      if (tempsActuel - tempsDebut >= DUREE_ORANGE) {
+        Serial.println(F("---> PRIO_ROUGE"));
+        etatActuel = PRIO_ROUGE;
+        tempsDebut = tempsActuel;
+      }
+      break;
+      
+    case PRIO_ROUGE:
+      afficherEtat("PRIO_ROUGE", tempsActuel);
+      digitalWrite(LED_VERT_VEHICULE, LOW);
+      digitalWrite(LED_ORANGE_VEHICULE, LOW);
+      digitalWrite(LED_ROUGE_VEHICULE, HIGH);
+      digitalWrite(LED_VERT_PIETON, LOW);
+      digitalWrite(LED_ROUGE_PIETON, HIGH);
+      
+      if (tempsActuel - tempsDebut >= DUREE_ROUGE) {
+        Serial.println(F("---> VERT_NORMAL"));
+        etatActuel = VERT_NORMAL;
+        tempsDebut = tempsActuel;
+      }
+      break;
+  }
+}
+
+// ========== FONCTIONS AUXILIAIRES ==========
+
+void eteindreToutesLED() {
+  digitalWrite(LED_VERT_VEHICULE, LOW);
+  digitalWrite(LED_ORANGE_VEHICULE, LOW);
+  digitalWrite(LED_ROUGE_VEHICULE, LOW);
+  digitalWrite(LED_VERT_PIETON, LOW);
+  digitalWrite(LED_ROUGE_PIETON, LOW);
+}
+
+void gererBoutonPrioritaire(unsigned long tempsActuel) {
+  bool etatBouton = digitalRead(BTN_PRIORITAIRE);
+  
+  // Détection du front montant (passage de LOW à HIGH)
+  if (etatBouton == HIGH && dernierEtatBtnPrio == LOW &&
+      tempsActuel - dernierAppuiPrio > DELAI_ANTIREBOND) {
+    
+    if (!modePrioritaireActif) {
+      // ACTIVATION du mode prioritaire (1er clic)
+      Serial.println(F(">>> BTN PRIO (ON) <<<"));
+      
+      modePrioritaireActif = true;
+      etatActuel = PRIORITAIRE;
+      tempsDebut = tempsActuel;
+      demandePieton = false; // Annule toute demande piéton
+      
+    } else {
+      // DÉSACTIVATION du mode prioritaire (2ème clic)
+      Serial.println(F(">>> BTN PRIO (OFF) <<<"));
+      
+      modePrioritaireActif = false;
+      etatActuel = PRIO_SECURITE;
+      tempsDebut = tempsActuel;
+    }
+    
+    dernierAppuiPrio = tempsActuel;
+  }
+  
+  dernierEtatBtnPrio = etatBouton;
+}
+
+void gererBoutonDefaillant(unsigned long tempsActuel) {
+  bool etatBouton = digitalRead(BTN_DEFAILLANT);
+  
+  // Détection du front montant (passage de LOW à HIGH)
+  if (etatBouton == HIGH && dernierEtatBtnDefaillant == LOW &&
+      tempsActuel - dernierAppuiDefaillant > DELAI_ANTIREBOND) {
+    modeDefaillantActif = !modeDefaillantActif;
+    dernierAppuiDefaillant = tempsActuel;
+    
+    if (modeDefaillantActif) {
+      // Entrée en mode défaillant
+      Serial.println(F(">>> MODE DEFAILLANT (ON) <<<"));
+      etatActuel = DEFAILLANT;
+      tempsClignotement = tempsActuel;
+      etatClignotement = false;
+      modePrioritaireActif = false; // Désactive aussi le mode prio si actif
+    } else {
+      // Sortie du mode défaillant
+      Serial.println(F(">>> MODE DEFAILLANT (OFF) <<<"));
+      etatActuel = VERT_NORMAL;
+      tempsDebut = tempsActuel;
+      eteindreToutesLED();
+    }
+  }
+  
+  dernierEtatBtnDefaillant = etatBouton;
+}
+
+void gererModeDefaillant(unsigned long tempsActuel) {
+  // Éteindre toutes les LED sauf orange (qui clignote) et rouge piéton
+  digitalWrite(LED_VERT_VEHICULE, LOW);
+  digitalWrite(LED_ROUGE_VEHICULE, LOW);
+  digitalWrite(LED_VERT_PIETON, LOW);
+  digitalWrite(LED_ROUGE_PIETON, HIGH);
+  
+  // Gestion du clignotement orange (1 Hz: 0,5s ON / 0,5s OFF)
+  if (tempsActuel - tempsClignotement >= DUREE_CLIGNOTEMENT) {
+    etatClignotement = !etatClignotement;
+    digitalWrite(LED_ORANGE_VEHICULE, etatClignotement ? HIGH : LOW);
+    tempsClignotement = tempsActuel;
+  }
+}
+
+// Fonction pour afficher l'état actuel (évite la répétition)
+Etat dernierEtatAffiche = DEFAILLANT; // Valeur initiale différente
+
+void afficherEtat(const char* nomEtat, unsigned long tempsActuel) {
+  // N'affiche que lors d'un changement d'état
+  if (etatActuel != dernierEtatAffiche) {
+    Serial.print(F("["));
+    Serial.print(tempsActuel / 1000.0, 1);
+    Serial.print(F("s] Etat : "));
+    Serial.println(nomEtat);
+    dernierEtatAffiche = etatActuel;
+  }
+}
+
+// Fonction de gestion des commandes série pour mode test photos
+void gererCommandesSerie() {
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    
+    // Vider le buffer série
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+    
+    switch (cmd) {
+      case 'T':
+      case 't':
+        modeTestActif = !modeTestActif;
+        if (modeTestActif) {
+          Serial.println(F("\n*** MODE TEST ACTIVE ***"));
+          Serial.println(F("Utilisez V/O/R/P/D pour controler"));
+        } else {
+          Serial.println(F("\n*** MODE TEST DESACTIVE ***"));
+          eteindreToutesLED();
+          digitalWrite(LED_ROUGE_PIETON, HIGH);
+          digitalWrite(LED_VERT_VEHICULE, HIGH);
+          etatActuel = VERT_NORMAL;
+          tempsDebut = millis();
+        }
+        break;
+        
+      case 'V':
+      case 'v':
+        if (modeTestActif) {
+          Serial.println(F("TEST: Feu VERT vehicule"));
+          eteindreToutesLED();
+          digitalWrite(LED_VERT_VEHICULE, HIGH);
+          digitalWrite(LED_ROUGE_PIETON, HIGH);
+        }
+        break;
+        
+      case 'O':
+      case 'o':
+        if (modeTestActif) {
+          Serial.println(F("TEST: Feu ORANGE vehicule"));
+          eteindreToutesLED();
+          digitalWrite(LED_ORANGE_VEHICULE, HIGH);
+          digitalWrite(LED_ROUGE_PIETON, HIGH);
+        }
+        break;
+        
+      case 'R':
+      case 'r':
+        if (modeTestActif) {
+          Serial.println(F("TEST: Feu ROUGE vehicule"));
+          eteindreToutesLED();
+          digitalWrite(LED_ROUGE_VEHICULE, HIGH);
+          digitalWrite(LED_ROUGE_PIETON, HIGH);
+        }
+        break;
+        
+      case 'P':
+      case 'p':
+        if (modeTestActif) {
+          Serial.println(F("TEST: Pieton TRAVERSE"));
+          eteindreToutesLED();
+          digitalWrite(LED_ROUGE_VEHICULE, HIGH);
+          digitalWrite(LED_VERT_PIETON, HIGH);
+        }
+        break;
+        
+      case 'D':
+      case 'd':
+        if (modeTestActif) {
+          Serial.println(F("TEST: Mode DEFAILLANT"));
+          eteindreToutesLED();
+          digitalWrite(LED_ORANGE_VEHICULE, HIGH);
+          digitalWrite(LED_ROUGE_PIETON, HIGH);
+        }
+        break;
+        
+      case 'N':
+      case 'n':
+        if (modeTestActif) {
+          Serial.println(F("TEST: Tout eteint"));
+          eteindreToutesLED();
+        }
+        break;
+        
+      case '?':
+        Serial.println(F("\n=== COMMANDES TEST ==="));
+        Serial.println(F("T = Toggle mode test"));
+        Serial.println(F("V = Vert"));
+        Serial.println(F("O = Orange"));
+        Serial.println(F("R = Rouge"));
+        Serial.println(F("P = Pieton"));
+        Serial.println(F("D = Defaillant"));
+        Serial.println(F("N = Eteindre"));
+        Serial.println(F("? = Aide"));
+        Serial.println(F("=====================\n"));
+        break;
+    }
+  }
+}
+
